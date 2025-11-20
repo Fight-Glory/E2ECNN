@@ -15,10 +15,14 @@ class E2ECNN(nn.Module):
         self.res3_en = res_block()
         self.res4_en = res_block()
         self.res5_en = res_block()
+        self.res6_en = res_block()
+        self.res7_en = res_block()
         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.relu2 = nn.ReLU(inplace=True)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.relu3 = nn.ReLU(inplace=True)
+        self.res7_de = res_block()
+        self.res6_de = res_block()
         self.res5_de = res_block()
         self.res4_de = res_block()
         self.res3_de = res_block()
@@ -43,12 +47,18 @@ class E2ECNN(nn.Module):
         x3 = self.res3_en(x2)
         x4 = self.res4_en(x3)
         x5 = self.res5_en(x4)
+        x6 = self.res6_en(x5)
+        x7 = self.res7_en(x6)
 
-        x5_1 = self.conv2(x5)
-        x5_1 = self.relu2(x5_1)
-        x5_1 = self.conv3(x5_1)
-        x5_1 = self.relu3(x5_1)
+        x7_1 = self.conv2(x7)
+        x7_1 = self.relu2(x7_1)
+        x7_1 = self.conv3(x7_1)
+        x7_1 = self.relu3(x7_1)
         ###################  decoder  ##################
+        x7_1 = x7 + x7_1
+        x6_1 = self.res7_de(x7_1)
+        x6_1 = x6 + x6_1
+        x5_1 = self.res6_de(x6_1)
         x5_1 = x5 + x5_1
         x4_1 = self.res5_de(x5_1)
         x4_1 = x4 + x4_1
