@@ -12,6 +12,8 @@ import os
 import numpy as np
 from torch.autograd import Variable
 import pytorch_ssim
+import ssim  # 新增：用于 MS-SSIM 计算
+import csv  # NEW: for metric logging
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -52,14 +54,41 @@ if last_train != 0:
 
 loss = nn.MSELoss()
 loss.cuda()
-# ms_ssim = ssim.MS_SSIM(data_range=1., channel=compress_rate)
-# ms_ssim.cuda()
+# 新增：启用 MS-SSIM 指标，保持与原始损失设计一致
+ms_ssim_metric = ssim.MS_SSIM(data_range=1., channel=compress_rate)
+ms_ssim_metric.cuda()
+
+
+# NEW: 统一的指标记录函数，确保每轮以追加方式写入 CSV
+def log_metrics(log_path, exp_name, epoch, phase, loss_value, psnr, ssim_val, lr, time_sec):
+    """将单条指标写入 CSV，若文件不存在则自动写入表头。"""
+    header = ['exp_name', 'epoch', 'phase', 'loss', 'psnr', 'ssim', 'learning_rate', 'time_sec']
+    file_exists = os.path.exists(log_path)
+    with open(log_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(header)
+        writer.writerow([
+            exp_name,
+            int(epoch),
+            phase,
+            float(loss_value) if loss_value != '' else '',
+            float(psnr) if psnr != '' else '',
+            float(ssim_val) if ssim_val != '' else '',
+            float(lr) if lr != '' else '',
+            float(time_sec) if time_sec != '' else ''
+        ])
 
 
 def validate(test_path, epoch, result_path, psnr_epoch, ssim_epoch):
+    # 新增：验证阶段仅做前向推理与指标统计
+    net.eval()
+    begin = time.time()
     test_list = os.listdir(test_path)
     psnr_sample = torch.zeros(len(test_list))
     ssim_sample = torch.zeros(len(test_list))
+    loss_accum = 0.0  # NEW: accumulate validation loss
+    frame_counter = 0  # NEW: count frames for average loss
     for i in range(len(test_list)):
         pic = scio.loadmat(test_path + '/' + test_list[i])
 
@@ -102,8 +131,6 @@ def validate(test_path, epoch, result_path, psnr_epoch, ssim_epoch):
             for ii in range(meas.shape[0]):
                 begin=time.time()
                 out_pic = net(mask, torch.unsqueeze(meas_re[ii, :, :, :], dim=0), block_size, compress_rate)
-                # recon_net.eval()
-                # out_pic = recon_net(out_1)
                 end = time.time()
                 print("time is {:.6f}".format(end-begin))
 
@@ -114,8 +141,8 @@ def validate(test_path, epoch, result_path, psnr_epoch, ssim_epoch):
                     gt_t = pic_gt[ii, jj, :, :]
                     mse_forward = loss(out_pic_forward * 255, gt_t * 255)
                     mse_forward = mse_forward.data
-                    # print("dataset {}, batch {}, compress_rate {}, the loss is {}".format(
-                    #     i, ii, jj, mse_forward))
+                    loss_accum += mse_forward.item()  # NEW: accumulate loss
+                    frame_counter += 1  # NEW: count frames
                     psnr_1 += 10 * torch.log10(255 * 255 / mse_forward)
                     ssim_1 += pytorch_ssim.ssim(out_pic_forward, gt_t)
 
@@ -130,55 +157,70 @@ def validate(test_path, epoch, result_path, psnr_epoch, ssim_epoch):
     print("PSNR result: {:.4f}".format(torch.mean(psnr_sample)),
           "     SSIM result: {:.6f}".format(torch.mean(ssim_sample)))
 
+    val_loss = loss_accum / max(frame_counter, 1)
+    val_psnr = torch.mean(psnr_sample)
+    val_ssim = torch.mean(ssim_sample)
+    elapsed = time.time() - begin
+
     psnr_epoch.append(psnr_sample)
     ssim_epoch.append(ssim_sample)
 
-    return psnr_epoch, ssim_epoch
+    return psnr_epoch, ssim_epoch, val_loss, val_psnr, val_ssim, elapsed
 
 
-def train(epoch, learning_rate, result_path, psnr_epoch, ssim_epoch):
-    epoch_loss = 0
+def train(epoch, learning_rate, optimizer):
+    """执行单轮训练并返回平均损失与指标。"""
+    net.train()  # 新增：显式切换到训练模式
+    epoch_loss = 0.0
     begin = time.time()
-    # psnr_epoch = []
-    # ssim_epoch = []
+    psnr_acc = 0.0
+    ssim_acc = 0.0
+    batch_counter = 0
 
-    optimizer = optim.Adam(params=net.parameters(), lr=learning_rate)
+    for iteration, batch in enumerate(train_data_loader):
+        gt, meas = Variable(batch[0]), Variable(batch[1])
+        gt = gt.cuda().float()  # [batch,8,256,256]
+        meas = meas.cuda().float()  # [batch,256 256]
 
-    if __name__ == '__main__':
-        for iteration, batch in enumerate(train_data_loader):
-            gt, meas = Variable(batch[0]), Variable(batch[1])
-            gt = gt.cuda().float()  # [batch,8,256,256]
-            meas = meas.cuda().float()  # [batch,256 256]
+        meas_re = torch.div(meas, mask_s)
+        meas_re = torch.unsqueeze(meas_re, 1)
 
-            meas_re = torch.div(meas, mask_s)
-            meas_re = torch.unsqueeze(meas_re, 1)
+        optimizer.zero_grad()  # 新增：训练阶段执行反向传播前清梯度
 
-            batch_size1 = gt.shape[0]
+        output = net(mask, meas_re, block_size, compress_rate)
 
-            output = net(mask, meas_re, block_size, compress_rate)
+        Loss1 = torch.sqrt(loss(output, gt))
+        Loss2 = ms_ssim_metric(output * 255, gt * 255, data_range=255, size_average=False).mean()
 
-            optimizer.zero_grad()
+        Loss = Loss1 + 0.1 * (1 - Loss2)
 
-            Loss1 = torch.sqrt(loss(output, gt))
-            Loss2 = ms_ssim(output*255, gt*255, data_range=255, size_average=False).mean()
+        epoch_loss += Loss.item()
 
-            Loss = Loss1 + 0.1 * (1 - Loss2)
+        # 计算训练阶段的 PSNR/SSIM 便于日志记录
+        mse_batch = torch.mean((output - gt) ** 2)
+        psnr_batch = 10 * torch.log10(255 * 255 / mse_batch)
+        ssim_batch = pytorch_ssim.ssim(output, gt)
+        psnr_acc += psnr_batch.item()
+        ssim_acc += ssim_batch.item()
+        batch_counter += 1
 
-            epoch_loss += Loss.data
+        if iteration % 1000 == 0:
+            print("======>Iteration {} at epoch {}, the loss is {:.8f}, ssim 2 is {:.4f}"
+                  .format(iteration, epoch, Loss.item(), Loss2.item()))
 
-            if iteration % 1000 == 0:
-                print("======>Iteration {} at epoch {}, the loss is {:.8f}, ssim 2 is {:.4f}"
-                      .format(iteration, epoch, Loss.item(),  Loss2.item()))
-            Loss.backward()
-            optimizer.step()
-
-        psnr_epoch, ssim_epoch = validate(test_path1, epoch, result_path, psnr_epoch, ssim_epoch)
+        Loss.backward()  # 新增：反向传播
+        optimizer.step()  # 新增：参数更新
 
     end = time.time()
     print("===> Epoch {} Complete: Avg. Loss: {:.7f}".format(epoch, epoch_loss / len(train_data_loader)),
           "  time: {:.2f}".format(end - begin))
 
-    return psnr_epoch, ssim_epoch
+    train_loss = epoch_loss / len(train_data_loader)
+    train_psnr = psnr_acc / max(batch_counter, 1)
+    train_ssim = ssim_acc / max(batch_counter, 1)
+    train_time = end - begin
+
+    return train_loss, train_psnr, train_ssim, train_time
 
 
 def checkpoint(epoch, model_path):
@@ -199,13 +241,30 @@ def main(learning_rate):
     psnr_epoch = []
     ssim_epoch = []
     psnr_max = 0
+    exp_name = os.path.basename(result_path)  # 新增：用于日志标识当前实验
+    log_file = os.path.join(result_path, 'training_log.csv')
+
+    # 新增：优化器在训练循环外创建，防止每轮重新初始化
+    optimizer = optim.Adam(params=net.parameters(), lr=learning_rate)
 
     for epoch in range(last_train + 1, max_iter + 1):
         print("epoch ", epoch)
-        # checkpoint2(epoch, model_path)
-        # psnr_epoch, ssim_epoch = train(epoch, learning_rate, result_path, psnr_epoch, ssim_epoch)
-        psnr_epoch, ssim_epoch = validate(test_path1, epoch, result_path, psnr_epoch, ssim_epoch)
+
+        # 新增：保持学习率计划的同时不重建优化器
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate
+
+        # 1. 训练一轮
+        train_loss, train_psnr, train_ssim, train_time = train(epoch, learning_rate, optimizer)
+
+        # 2. 验证一轮
+        psnr_epoch, ssim_epoch, val_loss, val_psnr, val_ssim, val_time = validate(test_path1, epoch, result_path, psnr_epoch, ssim_epoch)
         psnr_mean = torch.mean(psnr_epoch[-1])
+
+        # 新增：分别记录 train / val 的指标到 CSV
+        log_metrics(log_file, exp_name, epoch, 'train', train_loss, train_psnr, train_ssim, learning_rate, train_time)
+        log_metrics(log_file, exp_name, epoch, 'val', val_loss, val_psnr.item(), val_ssim.item(), learning_rate, val_time)
+
         if psnr_mean > psnr_max:
             psnr_max = psnr_mean
             if psnr_mean > 29.5:
